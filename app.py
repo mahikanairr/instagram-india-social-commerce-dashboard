@@ -2,10 +2,13 @@ import os
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from streamlit_autorefresh import st_autorefresh
 
 st.set_page_config(page_title='India Social Commerce Intelligence', page_icon='📊', layout='wide')
 st.title('Instagram India · Social Commerce Intelligence')
 st.caption('Monitored public Instagram content · sample-based intelligence, not platform-wide market totals')
+# Rerun open browser sessions every 5 minutes. Cached API reads expire after 300 seconds.
+st_autorefresh(interval=300000, limit=None, key='auto_refresh_5m')
 
 try:
     import requests
@@ -35,6 +38,12 @@ try:
     posts = load_sheet('Posts', endpoint, reader_secret)
     tags = load_sheet('Hashtag_Candidates', endpoint, reader_secret)
     history = load_sheet('Query_History', endpoint, reader_secret)
+    try:
+        ingestion_log = load_sheet('Ingestion_Log', endpoint, reader_secret)
+        ingestion_log_error = None
+    except Exception as log_err:
+        ingestion_log = pd.DataFrame()
+        ingestion_log_error = str(log_err)
 except Exception as err:
     st.error('Could not load the private Google Sheet. Check the Apps Script deployment and Streamlit secrets.')
     st.code(str(err)); st.stop()
@@ -47,6 +56,36 @@ posts['Published_Date']=pd.to_datetime(posts.get('Published_Date'),errors='coerc
 posts['Observation_Date']=pd.to_datetime(posts.get('Observation_Date'),errors='coerce')
 posts['Post_ID']=posts['Post_ID'].astype('string').str.replace(r'\.0$','',regex=True)
 posts=posts.drop_duplicates(subset=['Post_ID'],keep='last')
+
+# Show auditable ingestion activity. Distinguish successful database uploads from
+# Instagram observation dates (which are different measurements).
+st.subheader('Data freshness and pipeline')
+fresh_a, fresh_b, fresh_c = st.columns(3)
+obs = posts['Observation_Date'].max()
+fresh_a.metric('Latest observation', obs.strftime('%d %b %Y') if pd.notna(obs) else 'Not recorded')
+
+if not ingestion_log.empty and 'Status' in ingestion_log.columns:
+    log = ingestion_log.copy()
+    log['At'] = pd.to_datetime(log.get('At'), errors='coerce')
+    log = log.sort_values('At', ascending=False, na_position='last')
+    successful = log[log['Status'].astype(str).str.upper().eq('OK')]
+    recent = log.iloc[0]
+    if not successful.empty and pd.notna(successful.iloc[0]['At']):
+        fresh_b.metric('Last successful upload', successful.iloc[0]['At'].strftime('%d %b %Y %H:%M'))
+    else:
+        fresh_b.metric('Last successful upload', 'Not recorded')
+    status = str(recent.get('Status','Unknown')).upper()
+    fresh_c.metric('Latest receiver result', status)
+    if status != 'OK':
+        st.warning('Latest recorded receiver attempt did not report OK. Review upload logs.')
+    with st.expander('Recent Google Sheets ingestion log'):
+        st.dataframe(log.head(15), use_container_width=True, hide_index=True)
+else:
+    fresh_b.metric('Last successful upload', 'Not available')
+    fresh_c.metric('Latest receiver result', 'Not available')
+    st.caption('Ingestion log unavailable: enable Ingestion_Log in the Apps Script read allowlist.')
+st.caption('Open dashboard sessions refresh every 5 minutes. Last upload refers to the receiver log, not necessarily the last successful AllyHub search. Weekly collection status requires separate scheduled-run reporting.')
+
 
 with st.sidebar:
     st.header('Filters')
