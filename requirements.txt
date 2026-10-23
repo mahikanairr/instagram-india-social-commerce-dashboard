@@ -1,0 +1,4 @@
+streamlit>=1.39,<2
+st-gsheets-connection>=0.1.0
+pandas>=2.0
+plotly>=5.20
