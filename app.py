@@ -8,23 +8,36 @@ st.title('Instagram India · Social Commerce Intelligence')
 st.caption('Monitored public Instagram content · sample-based intelligence, not platform-wide market totals')
 
 try:
-    from streamlit_gsheets import GSheetsConnection
-    sheet_url = st.secrets.get('spreadsheet_url','')
-    if not sheet_url:
-        raise ValueError('Configure spreadsheet_url in Streamlit Secrets (see README).')
-    conn = st.connection('gsheets', type=GSheetsConnection)
-    @st.cache_data(ttl=300)
-    def load_data(_conn, sheet_url):
-        posts = _conn.read(spreadsheet=sheet_url, worksheet='Posts', ttl=300)
-        try: candidates = _conn.read(spreadsheet=sheet_url, worksheet='Hashtag_Candidates', ttl=300)
-        except Exception: candidates = pd.DataFrame()
-        try: history = _conn.read(spreadsheet=sheet_url, worksheet='Query_History', ttl=300)
-        except Exception: history = pd.DataFrame()
-        return posts, candidates, history
-    posts,tags,history=load_data(conn,sheet_url)
+    import requests
+    endpoint = st.secrets['apps_script_url']
+    reader_secret = st.secrets['dashboard_read_secret']
+
+    @st.cache_data(ttl=300, show_spinner='Loading private Google Sheets data…')
+    def load_sheet(sheet, _url, _secret):
+        all_rows = []
+        columns = None
+        for page in range(1000):
+            response = requests.post(_url, json={
+                'action': 'read', 'sheet': sheet, 'page': page,
+                'secret': _secret
+            }, timeout=45)
+            response.raise_for_status()
+            result = response.json()
+            if not result.get('ok'):
+                raise RuntimeError(result.get('error', 'Reader returned an error'))
+            if columns is None: columns = result['columns']
+            all_rows.extend(result.get('rows', []))
+            if not result.get('has_more'): break
+        else:
+            raise RuntimeError('Worksheet exceeded maximum page count')
+        return pd.DataFrame(all_rows, columns=columns)
+
+    posts = load_sheet('Posts', endpoint, reader_secret)
+    tags = load_sheet('Hashtag_Candidates', endpoint, reader_secret)
+    history = load_sheet('Query_History', endpoint, reader_secret)
 except Exception as err:
-    st.error('Could not load Google Sheets. Follow README configuration instructions.')
-    st.code(str(err));st.stop()
+    st.error('Could not load the private Google Sheet. Check the Apps Script deployment and Streamlit secrets.')
+    st.code(str(err)); st.stop()
 
 if posts.empty:
     st.info('No posts imported yet.');st.stop()
