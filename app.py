@@ -206,20 +206,86 @@ with t5:
         creator_stats['Interactions_per_observed_post'] = creator_stats['Observed_interactions']/creator_stats['Posts'].replace(0,float('nan'))
         st.dataframe(creator_stats.sort_values('Observed_interactions',ascending=False).head(20),hide_index=True,use_container_width=True)
 
-    st.markdown('#### Engagement by publication month')
-    st.caption('Compares available engagement snapshots of posts published in each month. This is NOT historical platform engagement growth: posts were measured at different ages and dates.')
-    monthly_eng=edf.dropna(subset=['Published_Date']).copy()
-    if not monthly_eng.empty:
-        monthly_eng['Publication_month']=monthly_eng['Published_Date'].dt.to_period('M').astype(str)
-        measured=monthly_eng.dropna(subset=['Likes'])
-        if not measured.empty:
-            trend=measured.groupby(['Publication_month','Product_Category'],dropna=False).agg(
-                Avg_observed_likes=('Likes','mean'),Measured_posts=('Post_ID','nunique')
-            ).reset_index()
-            st.plotly_chart(px.line(trend,x='Publication_month',y='Avg_observed_likes',color='Product_Category',markers=True,hover_data=['Measured_posts'],title='Mean observed likes by post publication month'),use_container_width=True)
+    st.markdown('#### Weekly and monthly performance')
+    st.caption('Compare posts by the week or month they were published. Likes and comments are available snapshots, not weekly increases on those same posts. Older posts may have had more time to gain engagement.')
+    periods = edf.dropna(subset=['Published_Date']).copy()
+    if periods.empty:
+        st.info('Publication dates are unavailable, so weekly/monthly comparisons cannot be calculated.')
+    else:
+        interval, measure = st.columns([1, 1])
+        with interval:
+            frequency = st.radio('Group posts by', ['Month', 'Week'], horizontal=True, key='engagement_grouping')
+        with measure:
+            chosen_measure = st.selectbox('Compare using', ['Median likes per measured post', 'Median comments per measured post', 'Posts published'], key='engagement_time_metric')
+        # Calendar-aligned buckets, not observation/collection dates.
+        period_code = 'W-SUN' if frequency == 'Week' else 'M'
+        periods['_period'] = periods['Published_Date'].dt.to_period(period_code)
+        periods['_period_start'] = periods['_period'].dt.start_time
+        periods['_period_label'] = periods['_period'].astype(str)
+        periods['_metric'] = pd.to_numeric(periods['Likes'] if chosen_measure.startswith('Median likes') else periods['Comments'], errors='coerce')
+        agg = periods.groupby(['_period_start', '_period_label'], as_index=False).agg(
+            Posts=('Post_ID', 'nunique'),
+            Creators=('Creator_Handle', 'nunique'),
+            Measured_posts=('_metric', 'count'),
+            Median_engagement=('_metric', 'median')
+        ).sort_values('_period_start')
+        if chosen_measure == 'Posts published':
+            agg['Plot_value'] = agg['Posts']
+            plot_label = 'Posts published in collected sample'
+        else:
+            # Require a few comparable measurements instead of amplifying 1-post outliers.
+            agg['Plot_value'] = agg['Median_engagement'].where(agg['Measured_posts'] >= 3)
+            plot_label = chosen_measure
+        total_buckets = len(agg)
+        if total_buckets > 24:
+            # Keep the trend readable; the full-period table is retained below.
+            chart_agg = agg.tail(24)
+            st.caption(f'Showing the most recent 24 {frequency.lower()}s in the chart; all {total_buckets} periods remain in the table.')
+        else:
+            chart_agg = agg
+        ca, cb, cc = st.columns(3)
+        ca.metric('Posts with publication dates', f"{len(periods):,}")
+        cb.metric('Time periods', f"{total_buckets:,}")
+        cc.metric('Metric coverage', f"{int(periods['_metric'].notna().sum()):,} / {len(periods):,}" if chosen_measure != 'Posts published' else 'Not required')
+        if chart_agg['Plot_value'].notna().any():
+            fig = px.bar(chart_agg, x='_period_label', y='Plot_value',
+                         custom_data=['Posts', 'Measured_posts', 'Creators'],
+                         labels={'_period_label':f'Publication {frequency.lower()}', 'Plot_value':plot_label},
+                         title=plot_label)
+            fig.update_traces(hovertemplate='<b>%{x}</b><br>Value: %{y:,.0f}<br>Posts: %{customdata[0]}<br>Measured posts: %{customdata[1]}<br>Creators: %{customdata[2]}<extra></extra>')
+            fig.update_layout(xaxis_tickangle=-35, showlegend=False, margin=dict(t=55,b=55))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info('At least three measured posts per period are needed for a reliable comparison. Try Monthly or Posts published.')
+        if chosen_measure != 'Posts published':
+            st.caption('Periods with fewer than 3 posts having this metric are hidden from the chart. Median reduces the influence of unusually viral posts.')
+        # Focus on the most recent period with available data, retaining sample sizes.
+        latest_bucket = agg['_period_start'].max()
+        by_category = periods[periods['_period_start'] == latest_bucket].groupby('Product_Category', dropna=False).agg(
+            Posts=('Post_ID','nunique'), Creators=('Creator_Handle','nunique'),
+            Measured_posts=('_metric','count'), Median_engagement=('_metric','median')
+        ).reset_index()
+        by_category['Coverage_pct'] = (100 * by_category['Measured_posts'] / by_category['Posts'].replace(0, float('nan'))).round(0)
+        by_category['Median_engagement'] = by_category['Median_engagement'].where(by_category['Measured_posts']>=3)
+        if chosen_measure == 'Posts published':
+            by_category = by_category.sort_values('Posts',ascending=False)
+        else:
+            by_category = by_category.sort_values('Median_engagement',ascending=False,na_position='last')
+        st.markdown(f"##### Categories in the latest publication {frequency.lower()}: {agg.iloc[-1]['_period_label']}")
+        st.caption('A blank median means fewer than three measured posts in that category during this period. This is not market share.')
+        shown = by_category.rename(columns={'Product_Category':'Category', 'Measured_posts':'Posts with metric',
+                                            'Median_engagement':'Median likes/comments', 'Coverage_pct':'Metric coverage (%)'})
+        columns = ['Category','Posts','Creators'] if chosen_measure == 'Posts published' else ['Category','Posts','Posts with metric','Median likes/comments','Metric coverage (%)']
+        st.dataframe(shown[columns], use_container_width=True, hide_index=True)
+        with st.expander('View all periods and measurement coverage'):
+            st.dataframe(agg[['_period_label','Posts','Creators','Measured_posts','Median_engagement']].rename(
+                columns={'_period_label':'Publication period','Measured_posts':'Posts with metric',
+                         'Median_engagement':'Median metric'}).sort_values('Publication period',ascending=False),
+                hide_index=True,use_container_width=True)
+        st.caption('These are comparisons between different publishing cohorts, not the growth of a fixed set of posts. For genuine same-post changes, use Engagement Growth below.')
 
-    st.markdown('#### Historical engagement growth · repeat observations')
-    st.caption('Repeat-measured five-post panel, not a representative estimate for all 15 categories. Observation dates and precision are retained.')
+    st.markdown('#### Engagement Growth')
+    st.caption('A small pilot tracking the same Instagram posts over time. This is not an estimate for all 15 categories.')
     if engagement_history.empty:
         st.info('Engagement_History is not connected or contains no observations yet. Existing engagement charts above continue to work.')
         if engagement_error:
@@ -229,40 +295,75 @@ with t5:
         eh['Post_ID'] = eh['Post_ID'].astype('string').str.strip()
         eh['Observation_Date'] = pd.to_datetime(eh['Observation_Date'], errors='coerce')
         for mc in ['Likes','Comments','Video_Views']:
-            eh[mc] = pd.to_numeric(eh[mc].replace('',pd.NA), errors='coerce')
+            eh[mc] = pd.to_numeric(eh[mc].replace('', pd.NA), errors='coerce')
         eh = eh.drop_duplicates(subset=['obs_key'], keep='last')
         if category:
             eh = eh[eh['Product_Category'].isin(category)]
-        st.caption(f"{eh['Post_ID'].nunique()} tracked posts · {len(eh)} observations · {eh['Observed_At_UTC'].astype(str).str.len().gt(0).sum()} exact-timestamp observations")
-        handles=sorted(eh['Creator_Handle'].dropna().astype(str).unique().tolist())
-        picked=st.multiselect('Tracked creators',handles,default=handles,key='engagement_tracked_creators')
-        if picked: eh=eh[eh['Creator_Handle'].isin(picked)]
-        for metric in ['Likes','Comments','Video_Views']:
-            graph=eh.dropna(subset=['Observation_Date',metric]).copy()
-            if not graph.empty:
-                graph['Series']=graph['Creator_Handle']+' · '+graph['Post_ID'].astype(str)
-                st.plotly_chart(px.line(graph.sort_values('Observation_Date'),x='Observation_Date',y=metric,color='Series',markers=True,
-                    hover_data=['Time_Precision','Method','Slot'],title=f'{metric.replace("_"," ")} · matched post observations'),use_container_width=True)
-        deltas=[]
-        for pid,g in eh.groupby('Post_ID'):
-            g=g.sort_values(['Observation_Date','Time_Precision','Observed_At_UTC'])
-            for metric in ['Likes','Comments','Video_Views']:
-                valid=g.dropna(subset=[metric])
-                if len(valid)>=2:
-                    previous,current=valid.iloc[-2],valid.iloc[-1]
-                    if previous['Observation_Date'] != current['Observation_Date']:
-                        deltas.append({'Creator':current['Creator_Handle'],'Category':current['Product_Category'],
-                            'Metric':metric,'Earlier date':previous['Observation_Date'].strftime('%Y-%m-%d'),
-                            'Later date':current['Observation_Date'].strftime('%Y-%m-%d'),
-                            'Earlier':previous[metric],'Latest':current[metric],
-                            'Change':current[metric]-previous[metric]})
-        if deltas:
-            st.markdown('##### Changes between different observation dates')
-            st.dataframe(pd.DataFrame(deltas),hide_index=True,use_container_width=True)
+        if eh.empty:
+            st.info('No tracked engagement history for the selected category.')
         else:
-            st.caption('Not enough different-day comparable observations yet for a growth table.')
-        st.dataframe(eh[['Post_ID','Creator_Handle','Product_Category','Observation_Date','Time_Precision','Likes','Comments','Video_Views','Retrieval_Status','Method']].sort_values('Observation_Date',ascending=False),
-          use_container_width=True,hide_index=True)
+            c1, c2, c3 = st.columns(3)
+            c1.metric('Posts tracked', int(eh['Post_ID'].nunique()))
+            c2.metric('Observations', len(eh))
+            c3.metric('Categories covered', int(eh['Product_Category'].nunique()))
+
+            # One digestible row per post. Only compare metric values when the
+            # observations were recorded on different calendar dates.
+            summaries=[]
+            for pid, group in eh.groupby('Post_ID'):
+                group=group.sort_values(['Observation_Date','Observed_At_UTC'],na_position='first')
+                last=group.iloc[-1]
+                row={'Creator':str(last['Creator_Handle']),'Category':str(last['Product_Category']),
+                     'Observations':len(group),'Last checked':last['Observation_Date'].strftime('%d %b %Y') if pd.notna(last['Observation_Date']) else 'Unknown',
+                     '_post_id':str(pid)}
+                for metric in ['Likes','Comments']:
+                    valid=group.dropna(subset=['Observation_Date',metric])
+                    if len(valid):
+                        latest=valid.iloc[-1]
+                        row['Latest '+metric.lower()]=int(latest[metric])
+                        older=valid[valid['Observation_Date'].dt.date < latest['Observation_Date'].date()]
+                        row[metric+' change']=int(latest[metric]-older.iloc[-1][metric]) if len(older) else None
+                    else:
+                        row['Latest '+metric.lower()]=None
+                        row[metric+' change']=None
+                summaries.append(row)
+            overview=pd.DataFrame(summaries).sort_values('Creator')
+            st.markdown('##### Latest engagement by creator')
+            st.caption('Change compares the latest value with a measurement from an earlier day. A dash means there are not yet two comparable dates.')
+            showcols=['Creator','Category','Last checked','Latest likes','Likes change','Latest comments','Comments change']
+            st.dataframe(overview[showcols],hide_index=True,use_container_width=True,
+                         column_config={'Latest likes':st.column_config.NumberColumn(format='%d'),
+                                        'Likes change':st.column_config.NumberColumn(format='%+d'),
+                                        'Latest comments':st.column_config.NumberColumn(format='%d'),
+                                        'Comments change':st.column_config.NumberColumn(format='%+d')})
+            st.markdown('##### Explore one tracked post')
+            options={f"{r['Creator']} · {r['Category']}":r['_post_id'] for r in summaries}
+            selected=st.selectbox('Choose a creator to see their history',options=list(options),
+                                  index=0,key='engagement_post_detail')
+            post=eh[eh['Post_ID']==options[selected]].sort_values(['Observation_Date','Observed_At_UTC'])
+            metric=st.radio('Measure', ['Likes','Comments','Video_Views'],horizontal=True,key='engagement_detail_metric')
+            chart=post.dropna(subset=['Observation_Date',metric]).copy()
+            if chart.empty:
+                st.info(f'No {metric.lower().replace("_", " ")} observations available for this post.')
+            else:
+                chart['Measured on']=chart['Observation_Date'].dt.strftime('%d %b %Y')
+                # A table remains readable with sparse, mixed-precision observations.
+                # Date-only records do not imply a precise collection time.
+                display=chart[['Measured on','Time_Precision',metric]].rename(columns={'Time_Precision':'Time accuracy'})
+                st.dataframe(display,hide_index=True,use_container_width=True)
+                if chart['Observation_Date'].dt.date.nunique() >= 2:
+                    fig=px.line(chart,x='Observation_Date',y=metric,markers=True,
+                                title=f'{metric.replace("_", " ")} over observation dates',
+                                hover_data=['Time_Precision'])
+                    fig.update_layout(xaxis_title='Date measured',yaxis_title=metric.replace('_',' '))
+                    st.plotly_chart(fig,use_container_width=True)
+                else:
+                    st.caption('A trend line will appear when this post has measurements on at least two different dates.')
+            with st.expander('View detailed engagement records'):
+                st.dataframe(eh[['Post_ID','Creator_Handle','Product_Category','Observation_Date','Time_Precision',
+                                 'Likes','Comments','Video_Views','Retrieval_Status','Method']]
+                             .sort_values('Observation_Date',ascending=False),
+                             use_container_width=True,hide_index=True)
 
     st.download_button('Download category engagement analysis',category_stats.to_csv(index=False).encode('utf-8-sig'),file_name='instagram_engagement_category_analysis.csv',mime='text/csv')
 
