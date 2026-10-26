@@ -39,6 +39,12 @@ try:
     tags = load_sheet('Hashtag_Candidates', endpoint, reader_secret)
     history = load_sheet('Query_History', endpoint, reader_secret)
     try:
+        engagement_history = load_sheet('Engagement_History', endpoint, reader_secret)
+        engagement_error = None
+    except Exception as eng_err:
+        engagement_history = pd.DataFrame()
+        engagement_error = str(eng_err)
+    try:
         ingestion_log = load_sheet('Ingestion_Log', endpoint, reader_secret)
         ingestion_log_error = None
     except Exception as log_err:
@@ -212,7 +218,52 @@ with t5:
             ).reset_index()
             st.plotly_chart(px.line(trend,x='Publication_month',y='Avg_observed_likes',color='Product_Category',markers=True,hover_data=['Measured_posts'],title='Mean observed likes by post publication month'),use_container_width=True)
 
-    st.info('True week-over-week engagement growth requires two or more engagement observations of the SAME post. The existing Posts sheet holds one row per post; it cannot establish historical growth by itself. The separate five-post validation history can be integrated into this tab later as a data source, without building a separate dashboard or re-fetching the 2,100 posts.')
+    st.markdown('#### Historical engagement growth · repeat observations')
+    st.caption('Repeat-measured five-post panel, not a representative estimate for all 15 categories. Observation dates and precision are retained.')
+    if engagement_history.empty:
+        st.info('Engagement_History is not connected or contains no observations yet. Existing engagement charts above continue to work.')
+        if engagement_error:
+            st.caption('History read status: '+engagement_error)
+    else:
+        eh = engagement_history.copy()
+        eh['Post_ID'] = eh['Post_ID'].astype('string').str.strip()
+        eh['Observation_Date'] = pd.to_datetime(eh['Observation_Date'], errors='coerce')
+        for mc in ['Likes','Comments','Video_Views']:
+            eh[mc] = pd.to_numeric(eh[mc].replace('',pd.NA), errors='coerce')
+        eh = eh.drop_duplicates(subset=['obs_key'], keep='last')
+        if category:
+            eh = eh[eh['Product_Category'].isin(category)]
+        st.caption(f"{eh['Post_ID'].nunique()} tracked posts · {len(eh)} observations · {eh['Observed_At_UTC'].astype(str).str.len().gt(0).sum()} exact-timestamp observations")
+        handles=sorted(eh['Creator_Handle'].dropna().astype(str).unique().tolist())
+        picked=st.multiselect('Tracked creators',handles,default=handles,key='engagement_tracked_creators')
+        if picked: eh=eh[eh['Creator_Handle'].isin(picked)]
+        for metric in ['Likes','Comments','Video_Views']:
+            graph=eh.dropna(subset=['Observation_Date',metric]).copy()
+            if not graph.empty:
+                graph['Series']=graph['Creator_Handle']+' · '+graph['Post_ID'].astype(str)
+                st.plotly_chart(px.line(graph.sort_values('Observation_Date'),x='Observation_Date',y=metric,color='Series',markers=True,
+                    hover_data=['Time_Precision','Method','Slot'],title=f'{metric.replace("_"," ")} · matched post observations'),use_container_width=True)
+        deltas=[]
+        for pid,g in eh.groupby('Post_ID'):
+            g=g.sort_values(['Observation_Date','Time_Precision','Observed_At_UTC'])
+            for metric in ['Likes','Comments','Video_Views']:
+                valid=g.dropna(subset=[metric])
+                if len(valid)>=2:
+                    previous,current=valid.iloc[-2],valid.iloc[-1]
+                    if previous['Observation_Date'] != current['Observation_Date']:
+                        deltas.append({'Creator':current['Creator_Handle'],'Category':current['Product_Category'],
+                            'Metric':metric,'Earlier date':previous['Observation_Date'].strftime('%Y-%m-%d'),
+                            'Later date':current['Observation_Date'].strftime('%Y-%m-%d'),
+                            'Earlier':previous[metric],'Latest':current[metric],
+                            'Change':current[metric]-previous[metric]})
+        if deltas:
+            st.markdown('##### Changes between different observation dates')
+            st.dataframe(pd.DataFrame(deltas),hide_index=True,use_container_width=True)
+        else:
+            st.caption('Not enough different-day comparable observations yet for a growth table.')
+        st.dataframe(eh[['Post_ID','Creator_Handle','Product_Category','Observation_Date','Time_Precision','Likes','Comments','Video_Views','Retrieval_Status','Method']].sort_values('Observation_Date',ascending=False),
+          use_container_width=True,hide_index=True)
+
     st.download_button('Download category engagement analysis',category_stats.to_csv(index=False).encode('utf-8-sig'),file_name='instagram_engagement_category_analysis.csv',mime='text/csv')
 
 st.divider()
