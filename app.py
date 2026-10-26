@@ -110,7 +110,7 @@ b.metric('Creators',f'{df.Creator_Handle.nunique():,}')
 c.metric('Categories',f'{df.Product_Category.nunique():,}')
 d.metric('Last observed',latest.strftime('%d %b %Y') if pd.notna(latest) else 'Historical')
 
-t1,t2,t3,t4=st.tabs(['Overview','Weekly discovery','Hashtags','Post explorer'])
+t1,t2,t3,t4,t5=st.tabs(['Overview','Weekly discovery','Hashtags','Post explorer','Engagement intelligence'])
 with t1:
     c1,c2=st.columns(2)
     with c1:
@@ -150,6 +150,70 @@ with t4:
     columns=[c for c in ['Post_ID','Post_URL','Published_Date','Creator_Handle','Product_Category','Content_Relevance_Class','Geo_Confidence','Creator_State','Likes','Comments','Video_Views','Content_Format','Exact_Query'] if c in df.columns]
     st.dataframe(df[columns],hide_index=True,use_container_width=True,column_config={'Post_URL':st.column_config.LinkColumn('Instagram post')})
     st.download_button('Download filtered posts CSV',df[columns].to_csv(index=False).encode('utf-8-sig'),file_name='instagram_filtered_posts.csv',mime='text/csv')
+
+
+with t5:
+    st.subheader('Instagram engagement intelligence')
+    st.caption('Observed engagement for monitored posts only. These are snapshots taken at different post ages, not platform-wide totals or repeat-measured growth.')
+    edf = df.copy()
+    edf['Observed_Interactions'] = edf[['Likes', 'Comments']].fillna(0).sum(axis=1)
+    post_n = len(edf)
+    n_likes = int(edf['Likes'].notna().sum())
+    n_comments = int(edf['Comments'].notna().sum())
+    n_views = int(edf['Video_Views'].notna().sum())
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric('Observed likes', f"{edf['Likes'].sum():,.0f}")
+    m2.metric('Observed comments', f"{edf['Comments'].sum():,.0f}")
+    m3.metric('Observed interactions', f"{edf['Observed_Interactions'].sum():,.0f}")
+    m4.metric('Posts with view counts', f'{n_views:,} / {post_n:,}')
+    st.caption(f'Metric availability — likes: {n_likes:,}/{post_n:,}; comments: {n_comments:,}/{post_n:,}; video views: {n_views:,}/{post_n:,}. Missing values are excluded from metric averages; views are not interpreted as zero.')
+
+    category_stats = edf.groupby('Product_Category', dropna=False).agg(
+        Posts=('Post_ID','nunique'),
+        Likes_observed=('Likes','sum'), Comments_observed=('Comments','sum'),
+        Posts_with_likes=('Likes','count'), Posts_with_comments=('Comments','count'),
+        Posts_with_views=('Video_Views','count'), Views_observed=('Video_Views','sum')
+    ).reset_index()
+    category_stats['Avg_likes_per_measured_post'] = category_stats['Likes_observed'] / category_stats['Posts_with_likes'].replace(0, float('nan'))
+    category_stats['Avg_comments_per_measured_post'] = category_stats['Comments_observed'] / category_stats['Posts_with_comments'].replace(0, float('nan'))
+    category_stats['Likes_coverage_pct'] = (100 * category_stats['Posts_with_likes'] / category_stats['Posts']).round(1)
+    category_stats['Views_coverage_pct'] = (100 * category_stats['Posts_with_views'] / category_stats['Posts']).round(1)
+    metric_choice = st.selectbox('Compare categories by', ['Average likes per measured post', 'Average comments per measured post', 'Total observed likes', 'Total observed comments', 'Posts with video views'], key='engagement_category_metric')
+    metric_map = {'Average likes per measured post':'Avg_likes_per_measured_post','Average comments per measured post':'Avg_comments_per_measured_post','Total observed likes':'Likes_observed','Total observed comments':'Comments_observed','Posts with video views':'Posts_with_views'}
+    chosen=metric_map[metric_choice]
+    show_cat=category_stats.sort_values(chosen,ascending=True)
+    st.plotly_chart(px.bar(show_cat,x=chosen,y='Product_Category',orientation='h',hover_data=['Posts','Likes_coverage_pct','Views_coverage_pct'],title=f'{metric_choice} · observed sample'),use_container_width=True)
+    with st.expander('Category engagement and measurement coverage',expanded=False):
+        st.dataframe(category_stats.sort_values('Posts',ascending=False),hide_index=True,use_container_width=True)
+
+    a,b=st.columns(2)
+    with a:
+        st.markdown('#### Highest-engagement observed posts')
+        top_posts=edf.sort_values('Observed_Interactions',ascending=False).head(20)
+        top_columns=[x for x in ['Post_URL','Creator_Handle','Product_Category','Published_Date','Likes','Comments','Video_Views','Observed_Interactions'] if x in top_posts.columns]
+        st.dataframe(top_posts[top_columns],hide_index=True,use_container_width=True,column_config={'Post_URL':st.column_config.LinkColumn('Open post')})
+    with b:
+        st.markdown('#### Creators in the monitored sample')
+        creator_stats=edf.groupby('Creator_Handle',dropna=False).agg(
+            Posts=('Post_ID','nunique'),Observed_interactions=('Observed_Interactions','sum'),Likes=('Likes','sum'),Comments=('Comments','sum')
+        ).reset_index()
+        creator_stats['Interactions_per_observed_post'] = creator_stats['Observed_interactions']/creator_stats['Posts'].replace(0,float('nan'))
+        st.dataframe(creator_stats.sort_values('Observed_interactions',ascending=False).head(20),hide_index=True,use_container_width=True)
+
+    st.markdown('#### Engagement by publication month')
+    st.caption('Compares available engagement snapshots of posts published in each month. This is NOT historical platform engagement growth: posts were measured at different ages and dates.')
+    monthly_eng=edf.dropna(subset=['Published_Date']).copy()
+    if not monthly_eng.empty:
+        monthly_eng['Publication_month']=monthly_eng['Published_Date'].dt.to_period('M').astype(str)
+        measured=monthly_eng.dropna(subset=['Likes'])
+        if not measured.empty:
+            trend=measured.groupby(['Publication_month','Product_Category'],dropna=False).agg(
+                Avg_observed_likes=('Likes','mean'),Measured_posts=('Post_ID','nunique')
+            ).reset_index()
+            st.plotly_chart(px.line(trend,x='Publication_month',y='Avg_observed_likes',color='Product_Category',markers=True,hover_data=['Measured_posts'],title='Mean observed likes by post publication month'),use_container_width=True)
+
+    st.info('True week-over-week engagement growth requires two or more engagement observations of the SAME post. The existing Posts sheet holds one row per post; it cannot establish historical growth by itself. The separate five-post validation history can be integrated into this tab later as a data source, without building a separate dashboard or re-fetching the 2,100 posts.')
+    st.download_button('Download category engagement analysis',category_stats.to_csv(index=False).encode('utf-8-sig'),file_name='instagram_engagement_category_analysis.csv',mime='text/csv')
 
 st.divider()
 st.caption('Source: historical Instagram snapshots plus AllyHub discovery. Likes/comments may be measured at different ages; missing views are not zero. Geography requires explicit evidence.')
